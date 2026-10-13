@@ -1,4 +1,6 @@
-use std::fs;
+use std::fs::{self, File};
+use std::io::{Read, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
@@ -7,6 +9,7 @@ use crate::container::chroot::ChrootRunner;
 use crate::error::DroidError;
 
 const TAILSCALE_BIN_REL: &str = "usr/sbin/tailscaled";
+const TAILSCALE_CLI_IN_CHROOT: &str = "/usr/bin/tailscale";
 const TAILSCALE_PID_REL: &str = "run/tailscaled.pid";
 const TAILSCALE_SOCKET_ARG: &str = "--socket=/run/tailscale/tailscaled.sock";
 const TAILSCALE_STATE_REL: &str = "var/lib/tailscale/tailscaled.state";
@@ -15,6 +18,8 @@ const TAILSCALE_ENABLED_REL: &str = "etc/droidvps/tailscale.enabled";
 const CLOUDFLARED_BIN_REL: &str = "usr/local/bin/cloudflared";
 const CLOUDFLARED_PID_REL: &str = "run/cloudflared.pid";
 const CLOUDFLARED_TOKEN_REL: &str = "etc/droidvps/cloudflared.token";
+const CLOUDFLARED_ARM64_URL: &str =
+    "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64";
 
 /// Proveedores de túnel soportados dentro del contenedor
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,7 +50,7 @@ pub enum TunnelStatus {
     NotConfigured,
 }
 
-/// Orquestador de túneles seguros (Tailscale / Cloudflare Tunnel) en el contenedor Alpine
+/// Orquestador inteligente de túneles seguros (Tailscale / Cloudflare Tunnel) en el contenedor Alpine
 pub struct TunnelService {
     rootfs: PathBuf,
 }
@@ -58,7 +63,8 @@ impl TunnelService {
         }
     }
 
-    /// Inicia automáticamente el túnel si existe una configuración activa en `/etc/droidvps/`
+    /// Inicia automáticamente el túnel si existe una configuración activa en `/etc/droidvps/`.
+    /// Si el binario requerido (`tailscaled` o `cloudflared`) no está instalado, lo instala automáticamente.
     pub fn start_if_configured(&self) -> Result<TunnelStatus, DroidError> {
         if let Some((provider, pid)) = self.active_daemon() {
             return Ok(TunnelStatus::Running { provider, pid });
@@ -67,7 +73,7 @@ impl TunnelService {
         self.ensure_config_dir()?;
 
         // Prioridad 1: Token de Cloudflare Tunnel configurado en /etc/droidvps/cloudflared.token
-        if self.has_cloudflared_token() && self.is_cloudflared_installed() {
+        if self.has_cloudflared_token() {
             let pid = self.start_cloudflared()?;
             return Ok(TunnelStatus::Running {
                 provider: TunnelProvider::Cloudflared,
@@ -87,6 +93,47 @@ impl TunnelService {
         Ok(TunnelStatus::NotConfigured)
     }
 
+    /// Flujo asistido para Tailscale: instala el paquete si falta, inicia `tailscaled`
+    /// y ejecuta `tailscale up` (con auth_key opcional o mostrando el enlace interactivo).
+    pub fn setup_and_authenticate_tailscale(
+        &self,
+        auth_key: Option<&str>,
+    ) -> Result<u32, DroidError> {
+        let pid = self.start_tailscale()?;
+        let runner = ChrootRunner::new(&self.rootfs);
+
+        println!("[*] Linking Tailscale node (follow the authentication link if it appears)...");
+        match auth_key {
+            Some(key) if !key.trim().is_empty() => {
+                let auth_arg = format!("--authkey={}", key.trim());
+                runner.run_command(
+                    TAILSCALE_CLI_IN_CHROOT,
+                    &[TAILSCALE_SOCKET_ARG, "up", &auth_arg],
+                )?;
+            }
+            _ => {
+                runner.run_command(TAILSCALE_CLI_IN_CHROOT, &[TAILSCALE_SOCKET_ARG, "up"])?;
+            }
+        }
+
+        Ok(pid)
+    }
+
+    /// Flujo asistido para Cloudflare Tunnel: valida y guarda el token con permisos `0600`,
+    /// descarga automáticamente el binario oficial `cloudflared` (`aarch64`) si no existe,
+    /// e inicia el demonio en segundo plano.
+    pub fn setup_and_start_cloudflared(&self, token: &str) -> Result<u32, DroidError> {
+        let clean_token = token.trim();
+        Self::validate_cloudflared_token(clean_token)?;
+
+        self.ensure_config_dir()?;
+        let token_path = self.rootfs.join(CLOUDFLARED_TOKEN_REL);
+        fs::write(&token_path, format!("{}\n", clean_token))?;
+        fs::set_permissions(&token_path, fs::Permissions::from_mode(0o600))?;
+
+        self.start_cloudflared()
+    }
+
     /// Instala (si es necesario) e inicia el demonio `tailscaled` en modo userspace networking
     pub fn start_tailscale(&self) -> Result<u32, DroidError> {
         if let Some(pid) = self.tailscale_pid() {
@@ -96,7 +143,7 @@ impl TunnelService {
         let runner = ChrootRunner::new(&self.rootfs);
 
         if !self.is_tailscale_installed() {
-            println!("[*] Instalando Tailscale dentro del contenedor Alpine...");
+            println!("[*] Tailscale not detected. Installing automatically via apk...");
             runner.run_command("/sbin/apk", &["update"])?;
             runner.run_command("/sbin/apk", &["add", "--no-cache", "tailscale"])?;
         }
@@ -115,7 +162,6 @@ impl TunnelService {
             fs::write(&enabled_marker, b"enabled\n")?;
         }
 
-        // Ejecución directa del binario sin intermediar /bin/sh
         runner.spawn_daemon(
             "/usr/sbin/tailscaled",
             &[
@@ -133,44 +179,32 @@ impl TunnelService {
         }
 
         Err(DroidError::Rootfs(
-            "tailscaled se ejecutó pero no se detectó su proceso activo en /proc".into(),
+            "tailscaled ran but no active process was detected in /proc".into(),
         ))
     }
 
-    /// Inicia `cloudflared` utilizando el token almacenado en `/etc/droidvps/cloudflared.token`
+    /// Descarga automáticamente `cloudflared` (si falta) e inicia el túnel con el token configurado
     pub fn start_cloudflared(&self) -> Result<u32, DroidError> {
         if let Some(pid) = self.cloudflared_pid() {
             return Ok(pid);
         }
 
-        if !self.is_cloudflared_installed() {
+        let token_path = self.rootfs.join(CLOUDFLARED_TOKEN_REL);
+        if !token_path.exists() {
             return Err(DroidError::Rootfs(
-                "El binario /usr/local/bin/cloudflared no está instalado en el contenedor".into(),
+                "No token is configured in /etc/droidvps/cloudflared.token".into(),
             ));
         }
 
-        let token_path = self.rootfs.join(CLOUDFLARED_TOKEN_REL);
         let token = fs::read_to_string(&token_path)
             .map_err(DroidError::Io)?
             .trim()
             .to_string();
 
-        if token.is_empty() {
-            return Err(DroidError::Rootfs(
-                "El archivo /etc/droidvps/cloudflared.token está vacío".into(),
-            ));
-        }
+        Self::validate_cloudflared_token(&token)?;
 
-        // Validar que el token solo contenga caracteres seguros (Base64/alfanuméricos/JWT)
-        if !token
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '=' || c == '.')
-        {
-            return Err(DroidError::Rootfs(
-                "El token en /etc/droidvps/cloudflared.token contiene caracteres inválidos".into(),
-            ));
-        }
-
+        // Auto-instalación inteligente si el binario no existe en el contenedor
+        self.ensure_cloudflared_installed()?;
         self.ensure_config_dir()?;
 
         let runner = ChrootRunner::new(&self.rootfs);
@@ -197,8 +231,54 @@ impl TunnelService {
         }
 
         Err(DroidError::Rootfs(
-            "cloudflared se ejecutó pero no registró un PID activo en /proc".into(),
+            "cloudflared ran but did not register an active PID in /proc".into(),
         ))
+    }
+
+    /// Garantiza que el binario `/usr/local/bin/cloudflared` (`aarch64`) esté instalado.
+    /// Si no existe, lo descarga por streaming HTTP con `ureq` y le asigna permisos `0755`.
+    pub fn ensure_cloudflared_installed(&self) -> Result<(), DroidError> {
+        if self.is_cloudflared_installed() {
+            return Ok(());
+        }
+
+        println!("[*] cloudflared binary not detected. Downloading the official version (linux-arm64)...");
+
+        let bin_path = self.rootfs.join(CLOUDFLARED_BIN_REL);
+        if let Some(parent) = bin_path.parent() {
+            if !parent.exists() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+
+        let temp_path = self.rootfs.join("usr/local/bin/cloudflared.tmp");
+
+        let response = ureq::get(CLOUDFLARED_ARM64_URL).call().map_err(|err| {
+            DroidError::Rootfs(format!(
+                "Failed to download cloudflared from GitHub Releases: {}",
+                err
+            ))
+        })?;
+
+        let mut reader = response.into_reader();
+        let mut temp_file = File::create(&temp_path)?;
+        let mut buffer = [0u8; 8192];
+
+        loop {
+            let bytes_read = reader.read(&mut buffer)?;
+            if bytes_read == 0 {
+                break;
+            }
+            temp_file.write_all(&buffer[..bytes_read])?;
+        }
+        temp_file.flush()?;
+        drop(temp_file);
+
+        fs::set_permissions(&temp_path, fs::Permissions::from_mode(0o755))?;
+        fs::rename(&temp_path, &bin_path)?;
+
+        println!("\x1b[1;32m[✓] cloudflared successfully installed at /usr/local/bin/cloudflared\x1b[0m");
+        Ok(())
     }
 
     /// Detiene cualquier demonio de túnel (`tailscaled` o `cloudflared`) en ejecución
@@ -254,6 +334,25 @@ impl TunnelService {
             return Some((TunnelProvider::Tailscale, pid));
         }
         None
+    }
+
+    fn validate_cloudflared_token(token: &str) -> Result<(), DroidError> {
+        if token.is_empty() {
+            return Err(DroidError::Rootfs(
+                "The Cloudflare Tunnel token cannot be empty".into(),
+            ));
+        }
+
+        if !token
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '=' || c == '.')
+        {
+            return Err(DroidError::Rootfs(
+                "The Cloudflare Tunnel token contains invalid characters".into(),
+            ));
+        }
+
+        Ok(())
     }
 
     fn is_tailscale_installed(&self) -> bool {
@@ -361,4 +460,4 @@ impl TunnelService {
         }
         Ok(())
     }
-}
+}

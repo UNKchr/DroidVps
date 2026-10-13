@@ -58,7 +58,7 @@ impl SshService {
         let runner = ChrootRunner::new(&self.rootfs);
 
         if !self.is_installed() {
-            println!("[*] Instalando Dropbear SSH dentro del contenedor Alpine...");
+            println!("[*] Installing Dropbear SSH inside the Alpine container...");
             runner.run_command("/sbin/apk", &["update"])?;
             runner.run_command(
                 "/sbin/apk",
@@ -128,7 +128,7 @@ impl SshService {
         }
 
         Err(DroidError::Rootfs(
-            "Dropbear se ejecutó pero no registró un PID activo en /run/dropbear.pid".into(),
+            "Dropbear ran but did not register an active PID in /run/dropbear.pid".into(),
         ))
     }
 
@@ -223,4 +223,4 @@ impl SshService {
 
         Ok(())
     }
-}
+}

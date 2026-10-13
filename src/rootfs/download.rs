@@ -18,7 +18,7 @@ pub fn download_and_verify(
 
     let mut reader = response.into_reader();
     let mut file = File::create(dest_path)?; // `?` delega automáticamente a DroidError::Io
-    
+
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 8192]; // Buffer de 8KB para streaming eficiente
 
@@ -26,9 +26,9 @@ pub fn download_and_verify(
     loop {
         let bytes_read = reader.read(&mut buffer)?;
         if bytes_read == 0 {
-            break; 
+            break;
         }
-        
+
         hasher.update(&buffer[..bytes_read]);
         file.write_all(&buffer[..bytes_read])?;
     }
@@ -40,12 +40,12 @@ pub fn download_and_verify(
     if hash_hex != expected_sha256 {
         // Eliminamos el archivo corrupto para evitar que extract.rs intente usarlo
         let _ = std::fs::remove_file(dest_path);
-        
+
         return Err(DroidError::Rootfs(format!(
-            "Integrity check failed for SHA256. Expected: {}, Computed: {}",
+            "SHA256 integrity check failed. Expected: {}, Computed: {}",
             expected_sha256, hash_hex
         )));
     }
 
     Ok(())
-}
+}

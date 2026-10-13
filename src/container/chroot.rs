@@ -51,7 +51,7 @@ impl ChrootRunner {
             // dentro de la shell es habitual, por lo que solo fallamos si fue terminado por señal crítica
             if status.code().is_none() {
                 return Err(DroidError::Rootfs(
-                    "La sesión interactiva en el chroot finalizó abruptamente por una señal".into(),
+                    "The interactive chroot session terminated abruptly due to a signal".into(),
                 ));
             }
         }
@@ -85,7 +85,7 @@ impl ChrootRunner {
         let status = cmd.status()?;
         if !status.success() {
             return Err(DroidError::Rootfs(format!(
-                "El comando '{} {}' dentro del chroot falló con estado: {}",
+                "Command '{} {}' inside the chroot failed with status: {}",
                 program,
                 args.join(" "),
                 status
@@ -126,7 +126,7 @@ impl ChrootRunner {
         if let Some(status) = child.try_wait()? {
             if !status.success() {
                 return Err(DroidError::Rootfs(format!(
-                    "El demonio '{}' terminó prematuramente con error: {}",
+                    "Daemon '{}' exited prematurely with error: {}",
                     program, status
                 )));
             }
@@ -134,4 +134,4 @@ impl ChrootRunner {
 
         Ok(())
     }
-}
+}

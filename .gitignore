@@ -1,6 +1,19 @@
-/target
+# Artefactos de compilación de Cargo / Cross
+/target/
+
+# Respaldos de rustfmt y editores
 **/*.rs.bk
-Cargo.lock
-.idea/
-.vscode/
 *.swp
+*.swo
+*~
+
+# Entornos de desarrollo e IDEs (conservando .vscode/settings.json)
+.idea/
+.vscode/*
+!.vscode/settings.json
+
+# Archivos temporales de sistema y pruebas locales de rootfs
+.DS_Store
+Thumbs.db
+*.tar.gz
+/rootfs_test/

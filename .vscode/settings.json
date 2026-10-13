@@ -1,0 +1,5 @@
+{
+  "rust-analyzer.cargo.target": "aarch64-unknown-linux-musl",
+  "rust-analyzer.check.allTargets": false,
+  "terminal.integrated.defaultProfile.linux": "bash"
+}

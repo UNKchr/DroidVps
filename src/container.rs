@@ -139,7 +139,7 @@ fn is_rootfs_initialized(rootfs: &Path) -> bool {
 fn verify_rootfs_initialized(rootfs: &Path) -> Result<(), DroidError> {
     if !is_rootfs_initialized(rootfs) {
         return Err(DroidError::Rootfs(format!(
-            "El entorno rootfs en '{}' no está inicializado. Ejecuta primero 'droidvps init'.",
+            "The rootfs environment at '{}' is not initialized. Run 'droidvps init' first.",
             rootfs.display()
         )));
     }
