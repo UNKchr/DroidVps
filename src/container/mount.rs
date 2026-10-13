@@ -1,77 +1,173 @@
-use crate::error::DroidError;
-use nix::mount::{mount, umount2, MntFlags, MsFlags};
 use std::fs;
 use std::path::{Path, PathBuf};
+use nix::mount::{mount, umount2, MntFlags, MsFlags};
+use crate::error::DroidError;
 
+const PROC_MOUNTS_PATH: &str = "/proc/mounts";
+
+/// Gestiona los montajes de pseudo-sistemas de archivos del kernel dentro del rootfs
 pub struct MountManager {
-    rootfs_path: PathBuf,
+    rootfs: PathBuf,
 }
 
 impl MountManager {
-    pub fn new(rootfs_path: &Path) -> Self {
+    /// Crea una nueva instancia del gestor de montajes para la ruta rootfs indicada
+    pub fn new<P: AsRef<Path>>(rootfs: P) -> Self {
         Self {
-            rootfs_path: rootfs_path.to_path_buf(),
+            rootfs: rootfs.as_ref().to_path_buf(),
         }
     }
 
-    /// Realiza los bind mounts necesarios para que el entorno de Alpine 
-    /// interactúe correctamente con el kernel de Android.
+    /// Monta de forma idempotente `/dev`, `/dev/pts`, `/proc` y `/sys` dentro del contenedor
     pub fn mount_all(&self) -> Result<(), DroidError> {
-        // Tupla: (Origen en Android, Destino en Rootfs, Flags de montaje)
-        let mounts = [
-            // MS_REC es clave en /dev para montar recursivamente sub-montajes si existen
-            ("/dev", "dev", MsFlags::MS_BIND | MsFlags::MS_REC),
-            ("/dev/pts", "dev/pts", MsFlags::MS_BIND),
-            ("/proc", "proc", MsFlags::MS_BIND),
-            ("/sys", "sys", MsFlags::MS_BIND),
-        ];
+        let dev_target = self.rootfs.join("dev");
+        let dev_pts_target = self.rootfs.join("dev/pts");
+        let dev_shm_target = self.rootfs.join("dev/shm");
+        let proc_target = self.rootfs.join("proc");
+        let sys_target = self.rootfs.join("sys");
 
-        for (src, dest, flags) in mounts.iter() {
-            let target = self.rootfs_path.join(dest);
-            
-            // Garantizamos que el punto de montaje exista en el contenedor
-            if !target.exists() {
-                fs::create_dir_all(&target)?;
+        // Asegurar que los directorios base existen antes de invocar mount(2)
+        for dir in [&dev_target, &proc_target, &sys_target] {
+            if !dir.exists() {
+                fs::create_dir_all(dir)?;
             }
+        }
 
+        // 1. Bind mount de /dev + esclavización de propagación (MS_SLAVE)
+        if !self.is_target_mounted(&dev_target) {
             mount(
-                Some(*src),
-                &target,
-                None::<&str>, // El fstype es ignorado en bind mounts
-                *flags,
-                None::<&str>, // Sin opciones extra de datos
-            ).map_err(|e| {
-                DroidError::Rootfs(format!("Error during installation {} in {:?}: {}", src, target, e))
-            })?;
+                Some(Path::new("/dev")),
+                &dev_target,
+                None::<&str>,
+                MsFlags::MS_BIND | MsFlags::MS_REC,
+                None::<&str>,
+            )?;
+            let _ = mount(
+                None::<&str>,
+                &dev_target,
+                None::<&str>,
+                MsFlags::MS_SLAVE | MsFlags::MS_REC,
+                None::<&str>,
+            );
+        }
+
+        // 2. Bind mount de /dev/pts (esencial para asignación de PTY en Dropbear SSH)
+        if !dev_pts_target.exists() {
+            let _ = fs::create_dir_all(&dev_pts_target);
+        }
+        if !self.is_target_mounted(&dev_pts_target) {
+            mount(
+                Some(Path::new("/dev/pts")),
+                &dev_pts_target,
+                None::<&str>,
+                MsFlags::MS_BIND,
+                None::<&str>,
+            )?;
+        }
+
+        // Asegurar directorio /dev/shm para memoria compartida POSIX
+        if !dev_shm_target.exists() {
+            let _ = fs::create_dir_all(&dev_shm_target);
+        }
+
+        // 3. Montaje de pseudo-filesystem /proc
+        if !self.is_target_mounted(&proc_target) {
+            mount(
+                Some("proc"),
+                &proc_target,
+                Some("proc"),
+                MsFlags::MS_NOSUID | MsFlags::MS_NODEV | MsFlags::MS_NOEXEC,
+                None::<&str>,
+            )?;
+        }
+
+        // 4. Bind mount de /sys + esclavización de propagación
+        if !self.is_target_mounted(&sys_target) {
+            mount(
+                Some(Path::new("/sys")),
+                &sys_target,
+                None::<&str>,
+                MsFlags::MS_BIND | MsFlags::MS_REC,
+                None::<&str>,
+            )?;
+            let _ = mount(
+                None::<&str>,
+                &sys_target,
+                None::<&str>,
+                MsFlags::MS_SLAVE | MsFlags::MS_REC,
+                None::<&str>,
+            );
         }
 
         Ok(())
     }
 
-    /// Revierte los montajes de forma segura para no dejar inconsistente a Android.
+    /// Desmonta de forma segura (`MNT_DETACH`) los sistemas de archivos en orden inverso
     pub fn unmount_all(&self) -> Result<(), DroidError> {
-        // El orden inverso es obligatorio. Desmontar /dev antes que /dev/pts 
-        // dejaría el filesystem bloqueado (Device or resource busy).
-        let mounts = ["sys", "proc", "dev/pts", "dev"];
+        let targets = [
+            self.rootfs.join("sys"),
+            self.rootfs.join("proc"),
+            self.rootfs.join("dev/pts"),
+            self.rootfs.join("dev"),
+        ];
 
-        for dest in mounts.iter() {
-            let target = self.rootfs_path.join(dest);
-            
-            if target.exists() {
-                // MNT_DETACH (lazy unmount) es crucial. Si un proceso de Alpine 
-                // se quedó zombie (ej. un daemon en background), un desmontaje normal fallaría.
-                // Detach obliga al VFS del kernel a desconectar el punto inmediatamente.
-                if let Err(e) = umount2(&target, MntFlags::MNT_DETACH) {
-                    // Ignoramos EINVAL (22) que significa que ya estaba desmontado o no es un mountpoint
-                    if e != nix::errno::Errno::EINVAL {
-                        return Err(DroidError::Rootfs(format!(
-                            "Critical error during disassembly {:?}: {}", target, e
-                        )));
-                    }
+        let mut last_error: Option<DroidError> = None;
+
+        for target in &targets {
+            if self.is_target_mounted(target) {
+                if let Err(err) = umount2(target, MntFlags::MNT_DETACH) {
+                    last_error = Some(DroidError::Nix(err));
                 }
             }
         }
 
+        if let Some(err) = last_error {
+            return Err(err);
+        }
+
         Ok(())
+    }
+
+    /// Devuelve `true` si al menos uno de los subsistemas clave del contenedor está montado
+    pub fn is_mounted(&self) -> bool {
+        !self.active_mounts().is_empty()
+    }
+
+    /// Lista los puntos de montaje relativos activos dentro del rootfs según `/proc/mounts`
+    pub fn active_mounts(&self) -> Vec<String> {
+        let candidates = ["dev", "dev/pts", "proc", "sys"];
+        let mut active = Vec::new();
+
+        for rel in candidates {
+            let full_path = self.rootfs.join(rel);
+            if self.is_target_mounted(&full_path) {
+                active.push(format!("/{}", rel));
+            }
+        }
+
+        active
+    }
+
+    /// Verifica en `/proc/mounts` si una ruta específica ya se encuentra montada
+    fn is_target_mounted(&self, target: &Path) -> bool {
+        let Ok(mounts_content) = fs::read_to_string(PROC_MOUNTS_PATH) else {
+            return false;
+        };
+
+        let canonical_target = fs::canonicalize(target).unwrap_or_else(|_| target.to_path_buf());
+        let target_str = canonical_target.to_string_lossy();
+        let raw_target_str = target.to_string_lossy();
+
+        for line in mounts_content.lines() {
+            let mut parts = line.split_whitespace();
+            let _source = parts.next();
+            if let Some(mount_point) = parts.next() {
+                if mount_point == target_str || mount_point == raw_target_str {
+                    return true;
+                }
+            }
+        }
+
+        false
     }
 }

@@ -1,1 +1,364 @@
-// Tailscale / Cloudflared setup
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::thread;
+use std::time::Duration;
+use crate::container::chroot::ChrootRunner;
+use crate::error::DroidError;
+
+const TAILSCALE_BIN_REL: &str = "usr/sbin/tailscaled";
+const TAILSCALE_PID_REL: &str = "run/tailscaled.pid";
+const TAILSCALE_SOCKET_ARG: &str = "--socket=/run/tailscale/tailscaled.sock";
+const TAILSCALE_STATE_REL: &str = "var/lib/tailscale/tailscaled.state";
+const TAILSCALE_ENABLED_REL: &str = "etc/droidvps/tailscale.enabled";
+
+const CLOUDFLARED_BIN_REL: &str = "usr/local/bin/cloudflared";
+const CLOUDFLARED_PID_REL: &str = "run/cloudflared.pid";
+const CLOUDFLARED_TOKEN_REL: &str = "etc/droidvps/cloudflared.token";
+
+/// Proveedores de túnel soportados dentro del contenedor
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TunnelProvider {
+    Tailscale,
+    Cloudflared,
+}
+
+impl TunnelProvider {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Tailscale => "Tailscale (userspace-networking)",
+            Self::Cloudflared => "Cloudflare Tunnel (cloudflared)",
+        }
+    }
+}
+
+/// Estado operativo del subsistema de túneles
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TunnelStatus {
+    Running {
+        provider: TunnelProvider,
+        pid: u32,
+    },
+    Stopped {
+        configured: Option<TunnelProvider>,
+    },
+    NotConfigured,
+}
+
+/// Orquestador de túneles seguros (Tailscale / Cloudflare Tunnel) en el contenedor Alpine
+pub struct TunnelService {
+    rootfs: PathBuf,
+}
+
+impl TunnelService {
+    /// Crea una nueva instancia del gestor de túneles para el `rootfs` especificado
+    pub fn new<P: AsRef<Path>>(rootfs: P) -> Self {
+        Self {
+            rootfs: rootfs.as_ref().to_path_buf(),
+        }
+    }
+
+    /// Inicia automáticamente el túnel si existe una configuración activa en `/etc/droidvps/`
+    pub fn start_if_configured(&self) -> Result<TunnelStatus, DroidError> {
+        if let Some((provider, pid)) = self.active_daemon() {
+            return Ok(TunnelStatus::Running { provider, pid });
+        }
+
+        self.ensure_config_dir()?;
+
+        // Prioridad 1: Token de Cloudflare Tunnel configurado en /etc/droidvps/cloudflared.token
+        if self.has_cloudflared_token() && self.is_cloudflared_installed() {
+            let pid = self.start_cloudflared()?;
+            return Ok(TunnelStatus::Running {
+                provider: TunnelProvider::Cloudflared,
+                pid,
+            });
+        }
+
+        // Prioridad 2: Tailscale habilitado o previamente autenticado
+        if self.is_tailscale_configured() {
+            let pid = self.start_tailscale()?;
+            return Ok(TunnelStatus::Running {
+                provider: TunnelProvider::Tailscale,
+                pid,
+            });
+        }
+
+        Ok(TunnelStatus::NotConfigured)
+    }
+
+    /// Instala (si es necesario) e inicia el demonio `tailscaled` en modo userspace networking
+    pub fn start_tailscale(&self) -> Result<u32, DroidError> {
+        if let Some(pid) = self.tailscale_pid() {
+            return Ok(pid);
+        }
+
+        let runner = ChrootRunner::new(&self.rootfs);
+
+        if !self.is_tailscale_installed() {
+            println!("[*] Instalando Tailscale dentro del contenedor Alpine...");
+            runner.run_command("/sbin/apk", &["update"])?;
+            runner.run_command("/sbin/apk", &["add", "--no-cache", "tailscale"])?;
+        }
+
+        let run_ts_dir = self.rootfs.join("run/tailscale");
+        let state_ts_dir = self.rootfs.join("var/lib/tailscale");
+        for dir in [&run_ts_dir, &state_ts_dir] {
+            if !dir.exists() {
+                fs::create_dir_all(dir)?;
+            }
+        }
+
+        self.ensure_config_dir()?;
+        let enabled_marker = self.rootfs.join(TAILSCALE_ENABLED_REL);
+        if !enabled_marker.exists() {
+            fs::write(&enabled_marker, b"enabled\n")?;
+        }
+
+        // Ejecución directa del binario sin intermediar /bin/sh
+        runner.spawn_daemon(
+            "/usr/sbin/tailscaled",
+            &[
+                "--tun=userspace-networking",
+                "--statedir=/var/lib/tailscale",
+                TAILSCALE_SOCKET_ARG,
+            ],
+        )?;
+
+        for _ in 0..20 {
+            if let Some(pid) = self.tailscale_pid() {
+                return Ok(pid);
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        Err(DroidError::Rootfs(
+            "tailscaled se ejecutó pero no se detectó su proceso activo en /proc".into(),
+        ))
+    }
+
+    /// Inicia `cloudflared` utilizando el token almacenado en `/etc/droidvps/cloudflared.token`
+    pub fn start_cloudflared(&self) -> Result<u32, DroidError> {
+        if let Some(pid) = self.cloudflared_pid() {
+            return Ok(pid);
+        }
+
+        if !self.is_cloudflared_installed() {
+            return Err(DroidError::Rootfs(
+                "El binario /usr/local/bin/cloudflared no está instalado en el contenedor".into(),
+            ));
+        }
+
+        let token_path = self.rootfs.join(CLOUDFLARED_TOKEN_REL);
+        let token = fs::read_to_string(&token_path)
+            .map_err(DroidError::Io)?
+            .trim()
+            .to_string();
+
+        if token.is_empty() {
+            return Err(DroidError::Rootfs(
+                "El archivo /etc/droidvps/cloudflared.token está vacío".into(),
+            ));
+        }
+
+        // Validar que el token solo contenga caracteres seguros (Base64/alfanuméricos/JWT)
+        if !token
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '=' || c == '.')
+        {
+            return Err(DroidError::Rootfs(
+                "El token en /etc/droidvps/cloudflared.token contiene caracteres inválidos".into(),
+            ));
+        }
+
+        self.ensure_config_dir()?;
+
+        let runner = ChrootRunner::new(&self.rootfs);
+        runner.spawn_daemon(
+            "/usr/local/bin/cloudflared",
+            &[
+                "tunnel",
+                "--no-autoupdate",
+                "--pidfile",
+                "/run/cloudflared.pid",
+                "--logfile",
+                "/var/log/cloudflared.log",
+                "run",
+                "--token",
+                &token,
+            ],
+        )?;
+
+        for _ in 0..20 {
+            if let Some(pid) = self.cloudflared_pid() {
+                return Ok(pid);
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        Err(DroidError::Rootfs(
+            "cloudflared se ejecutó pero no registró un PID activo en /proc".into(),
+        ))
+    }
+
+    /// Detiene cualquier demonio de túnel (`tailscaled` o `cloudflared`) en ejecución
+    pub fn stop(&self) -> Result<bool, DroidError> {
+        let mut stopped_any = false;
+
+        if let Some(pid) = self.tailscale_pid() {
+            self.kill_process(pid);
+            stopped_any = true;
+        }
+        let ts_pid_file = self.rootfs.join(TAILSCALE_PID_REL);
+        if ts_pid_file.exists() {
+            let _ = fs::remove_file(ts_pid_file);
+        }
+
+        if let Some(pid) = self.cloudflared_pid() {
+            self.kill_process(pid);
+            stopped_any = true;
+        }
+        let cf_pid_file = self.rootfs.join(CLOUDFLARED_PID_REL);
+        if cf_pid_file.exists() {
+            let _ = fs::remove_file(cf_pid_file);
+        }
+
+        Ok(stopped_any)
+    }
+
+    /// Consulta el estado actual del servicio de túneles
+    pub fn status(&self) -> TunnelStatus {
+        if let Some((provider, pid)) = self.active_daemon() {
+            return TunnelStatus::Running { provider, pid };
+        }
+
+        if self.has_cloudflared_token() {
+            TunnelStatus::Stopped {
+                configured: Some(TunnelProvider::Cloudflared),
+            }
+        } else if self.is_tailscale_configured() {
+            TunnelStatus::Stopped {
+                configured: Some(TunnelProvider::Tailscale),
+            }
+        } else {
+            TunnelStatus::NotConfigured
+        }
+    }
+
+    /// Devuelve el proveedor activo y su PID si hay un túnel en ejecución
+    pub fn active_daemon(&self) -> Option<(TunnelProvider, u32)> {
+        if let Some(pid) = self.cloudflared_pid() {
+            return Some((TunnelProvider::Cloudflared, pid));
+        }
+        if let Some(pid) = self.tailscale_pid() {
+            return Some((TunnelProvider::Tailscale, pid));
+        }
+        None
+    }
+
+    fn is_tailscale_installed(&self) -> bool {
+        self.rootfs.join(TAILSCALE_BIN_REL).exists()
+    }
+
+    fn is_tailscale_configured(&self) -> bool {
+        self.rootfs.join(TAILSCALE_ENABLED_REL).exists()
+            || self.rootfs.join(TAILSCALE_STATE_REL).exists()
+    }
+
+    fn is_cloudflared_installed(&self) -> bool {
+        self.rootfs.join(CLOUDFLARED_BIN_REL).exists()
+    }
+
+    fn has_cloudflared_token(&self) -> bool {
+        let path = self.rootfs.join(CLOUDFLARED_TOKEN_REL);
+        fs::read_to_string(path)
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false)
+    }
+
+    fn tailscale_pid(&self) -> Option<u32> {
+        self.resolve_daemon_pid(TAILSCALE_PID_REL, "tailscaled")
+    }
+
+    fn cloudflared_pid(&self) -> Option<u32> {
+        self.resolve_daemon_pid(CLOUDFLARED_PID_REL, "cloudflared")
+    }
+
+    /// Verifica el archivo PID o localiza el proceso en `/proc` actualizando el archivo PID
+    fn resolve_daemon_pid(&self, rel_path: &str, expected_process: &str) -> Option<u32> {
+        let pid_file = self.rootfs.join(rel_path);
+
+        if let Ok(raw_pid) = fs::read_to_string(&pid_file) {
+            if let Ok(pid) = raw_pid.trim().parse::<u32>() {
+                if Self::is_pid_matching_process(pid, expected_process) {
+                    return Some(pid);
+                }
+            }
+        }
+
+        let pid = Self::find_pid_by_cmdline(expected_process)?;
+        let _ = fs::write(&pid_file, format!("{}\n", pid));
+        Some(pid)
+    }
+
+    /// Comprueba si `/proc/<pid>/cmdline` contiene el nombre del binario esperado
+    fn is_pid_matching_process(pid: u32, expected_process: &str) -> bool {
+        if pid == 0 {
+            return false;
+        }
+        let proc_cmdline = PathBuf::from(format!("/proc/{}/cmdline", pid));
+        let Ok(cmdline_bytes) = fs::read(proc_cmdline) else {
+            return false;
+        };
+        let cmdline_lossy = String::from_utf8_lossy(&cmdline_bytes);
+        cmdline_lossy.contains(expected_process)
+    }
+
+    /// Busca en `/proc` un proceso activo cuya línea de comandos coincida con el demonio
+    fn find_pid_by_cmdline(expected_process: &str) -> Option<u32> {
+        let entries = fs::read_dir("/proc").ok()?;
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let Some(name_str) = file_name.to_str() else {
+                continue;
+            };
+            let Ok(pid) = name_str.parse::<u32>() else {
+                continue;
+            };
+            if Self::is_pid_matching_process(pid, expected_process) {
+                return Some(pid);
+            }
+        }
+        None
+    }
+
+    fn kill_process(&self, pid: u32) {
+        let pid_str = pid.to_string();
+        let killed = Command::new("kill")
+            .args(["-TERM", &pid_str])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+
+        if !killed {
+            let runner = ChrootRunner::new(&self.rootfs);
+            let _ = runner.run_command("/bin/kill", &["-TERM", &pid_str]);
+        }
+    }
+
+    fn ensure_config_dir(&self) -> Result<(), DroidError> {
+        let config_dir = self.rootfs.join("etc/droidvps");
+        if !config_dir.exists() {
+            fs::create_dir_all(&config_dir)?;
+        }
+        let log_dir = self.rootfs.join("var/log");
+        if !log_dir.exists() {
+            fs::create_dir_all(&log_dir)?;
+        }
+        let run_dir = self.rootfs.join("run");
+        if !run_dir.exists() {
+            fs::create_dir_all(&run_dir)?;
+        }
+        Ok(())
+    }
+}

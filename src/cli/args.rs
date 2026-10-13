@@ -1,7 +1,8 @@
+use std::path::PathBuf;
 use clap::{Parser, Subcommand};
+use crate::rootfs::DEFAULT_ROOTFS_PATH;
 
-/// Generamos el banner en tiempo de compilación integrando secuencias ANSI
-/// y extrayendo la versión directamente del Cargo.toml.
+/// Banner ASCII oficial con secuencias ANSI para la cabecera de ayuda de Clap
 pub const BANNER: &str = concat!(
     "\x1b[1;36m",
     "██████╗ ██████╗  ██████╗ ██╗██████╗ ██╗   ██╗██████╗ ███████╗\n",
@@ -10,14 +11,20 @@ pub const BANNER: &str = concat!(
     "██║  ██║██╔══██╗██║   ██║██║██║  ██║╚██╗ ██╔╝██╔═══╝ ╚════██║\n",
     "██████╔╝██║  ██║╚██████╔╝██║██████╔╝ ╚████╔╝ ██║     ███████║\n",
     "╚═════╝ ╚═╝  ╚═╝ ╚═════╝ ╚═╝╚═════╝   ╚═══╝  ╚═╝     ╚══════╝\n",
-    "\x1b[0m",
-    "  v", env!("CARGO_PKG_VERSION"), " • Developed by \x1b[1;32mUNKchr\x1b[0m\n"
+    "\x1b[1;32m  v",
+    env!("CARGO_PKG_VERSION"),
+    " • Developed by UNKchr\x1b[0m"
 );
 
 #[derive(Parser, Debug)]
-#[command(name = "droidvps")]
-#[command(about = "Orquestador de contenedores Linux para dispositivos Android", long_about = None)]
-#[command(before_help = BANNER)]
+#[command(
+    name = "droidvps",
+    author = "UNKchr",
+    version,
+    about = "Orquestador ligero para convertir dispositivos Android root en servidores Linux headless (VPS)",
+    long_about = None,
+    before_help = BANNER
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
@@ -25,27 +32,38 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Commands {
-    /// Descarga y aprovisiona el rootfs de Alpine Linux
+    /// Descarga, verifica y despliega el sistema base (Alpine Linux Minimal aarch64)
     Init {
-        #[arg(long, default_value = crate::rootfs::DEFAULT_ROOTFS_PATH)]
-        path: String,
+        /// Ruta de destino para el entorno rootfs en el dispositivo Android
+        #[arg(short, long, default_value = DEFAULT_ROOTFS_PATH)]
+        target: PathBuf,
     },
-    
-    /// Entra a una shell interactiva en el contenedor
+
+    /// Monta subsistemas del kernel e inicia una shell interactiva aislada en el contenedor
     Enter {
-        #[arg(long, default_value = crate::rootfs::DEFAULT_ROOTFS_PATH)]
-        path: String,
+        /// Ruta del entorno rootfs donde se ejecutará el chroot
+        #[arg(short, long, default_value = DEFAULT_ROOTFS_PATH)]
+        target: PathBuf,
     },
-    
-    /// Inicializa los servicios del contenedor (ej. SSH)
+
+    /// Inicia el servidor VPS en segundo plano (Wakelock, Dropbear SSH y túneles)
     Start {
-        #[arg(long, help = "Ejecuta los servicios en segundo plano")]
-        daemon: bool,
+        /// Ruta del entorno rootfs activo
+        #[arg(short, long, default_value = DEFAULT_ROOTFS_PATH)]
+        target: PathBuf,
     },
-    
-    /// Detiene los servicios y desmonta de forma segura
-    Stop,
-    
-    /// Reporta telemetría e inspecciona el estado del entorno
-    Status,
+
+    /// Detiene los servicios del VPS, desmonta los sistemas de archivos y libera el Wakelock
+    Stop {
+        /// Ruta del entorno rootfs a detener
+        #[arg(short, long, default_value = DEFAULT_ROOTFS_PATH)]
+        target: PathBuf,
+    },
+
+    /// Muestra el estado del contenedor, servicios activos y telemetría de hardware (batería/CPU)
+    Status {
+        /// Ruta del entorno rootfs a inspeccionar
+        #[arg(short, long, default_value = DEFAULT_ROOTFS_PATH)]
+        target: PathBuf,
+    },
 }
