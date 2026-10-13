@@ -1,0 +1,1 @@
+// Sysfs battery & thermal reads

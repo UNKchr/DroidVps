@@ -1,0 +1,23 @@
+[package]
+name = "droidvps"
+version = "0.1.0"
+edition = "2021"
+authors = []
+description = "Headless Linux container orchestrator for rooted Android devices"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive", "cargo"] }
+nix = { version = "0.29", features = ["mount", "user", "fs", "process", "term"] }
+ureq = "2.10"
+flate2 = "1.0"
+tar = "0.4"
+sha2 = "0.10"
+thiserror = "1.0"
+anyhow = "1.0"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
