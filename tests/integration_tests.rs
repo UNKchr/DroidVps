@@ -1,6 +1,7 @@
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
@@ -16,7 +17,7 @@ use droidvps::services::{
 fn create_temp_rootfs(test_name: &str) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .expect("Reloj del sistema válido")
+        .expect("Valid system clock")
         .as_nanos();
     let dir = env::temp_dir().join(format!(
         "droidvps_itest_{}_{}_{}",
@@ -24,13 +25,13 @@ fn create_temp_rootfs(test_name: &str) -> PathBuf {
         std::process::id(),
         nanos
     ));
-    fs::create_dir_all(&dir).expect("Debe crear directorio temporal de prueba");
+    fs::create_dir_all(&dir).expect("Should create temporary test directory");
     dir
 }
 
 #[test]
 fn test_cli_default_and_custom_targets() {
-    let cli = Cli::try_parse_from(["droidvps", "init"]).expect("Debe parsear subcomando init");
+    let cli = Cli::try_parse_from(["droidvps", "init"]).expect("Should parse init subcommand");
     assert_eq!(
         cli.command,
         Commands::Init {
@@ -40,7 +41,7 @@ fn test_cli_default_and_custom_targets() {
 
     let custom = "/data/local/custom_rootfs";
     let cli = Cli::try_parse_from(["droidvps", "enter", "--target", custom])
-        .expect("Debe parsear enter con --target personalizado");
+        .expect("Should parse enter with custom --target");
     assert_eq!(
         cli.command,
         Commands::Enter {
@@ -53,7 +54,7 @@ fn test_cli_default_and_custom_targets() {
 fn test_cli_tunnel_subcommands_parsing() {
     // Tailscale interactivo (sin auth-key)
     let cli = Cli::try_parse_from(["droidvps", "tunnel", "tailscale"])
-        .expect("Debe parsear tunnel tailscale interactivo");
+        .expect("Should parse interactive tunnel tailscale");
     assert_eq!(
         cli.command,
         Commands::Tunnel {
@@ -72,7 +73,7 @@ fn test_cli_tunnel_subcommands_parsing() {
         "--auth-key",
         "tskey-auth-xyz",
     ])
-    .expect("Debe parsear tunnel tailscale con auth-key");
+    .expect("Should parse tunnel tailscale with auth-key");
     assert_eq!(
         cli.command,
         Commands::Tunnel {
@@ -94,7 +95,7 @@ fn test_cli_tunnel_subcommands_parsing() {
         "--token",
         "eyJhIjoiMTIzNDUifQ==",
     ])
-    .expect("Debe parsear tunnel cloudflared con token");
+    .expect("Should parse tunnel cloudflared with token");
     assert_eq!(
         cli.command,
         Commands::Tunnel {
@@ -107,6 +108,41 @@ fn test_cli_tunnel_subcommands_parsing() {
 }
 
 #[test]
+fn test_cli_setup_subcommand_and_flag_conflicts() {
+    // Ejecución estándar de `droidvps setup`
+    let cli = Cli::try_parse_from(["droidvps", "setup"]).expect("Should parse setup subcommand");
+    assert_eq!(
+        cli.command,
+        Commands::Setup {
+            target: PathBuf::from(DEFAULT_ROOTFS_PATH),
+            enable_autostart: false,
+            disable_autostart: false,
+        }
+    );
+
+    // Con --enable-autostart
+    let cli = Cli::try_parse_from(["droidvps", "setup", "--enable-autostart"])
+        .expect("Should parse setup --enable-autostart");
+    assert_eq!(
+        cli.command,
+        Commands::Setup {
+            target: PathBuf::from(DEFAULT_ROOTFS_PATH),
+            enable_autostart: true,
+            disable_autostart: false,
+        }
+    );
+
+    // Conflicto mutuo: no debe permitir --enable-autostart y --disable-autostart al mismo tiempo
+    let conflict = Cli::try_parse_from([
+        "droidvps",
+        "setup",
+        "--enable-autostart",
+        "--disable-autostart",
+    ]);
+    assert!(conflict.is_err());
+}
+
+#[test]
 fn test_rootfs_android_groups_injection_is_idempotent() {
     let rootfs = create_temp_rootfs("android_groups");
     let etc_dir = rootfs.join("etc");
@@ -116,13 +152,13 @@ fn test_rootfs_android_groups_injection_is_idempotent() {
     fs::write(&group_file, "root:x:0:root\nwheel:x:10:root\n").unwrap();
 
     // 1ra pasada: inyecta 3003 y 3004
-    configure_android_groups(&rootfs).expect("Primera inyección de grupos Android");
+    configure_android_groups(&rootfs).expect("First Android group injection");
     let first = fs::read_to_string(&group_file).unwrap();
     assert!(first.contains("aid_inet:x:3003:root"));
     assert!(first.contains("aid_net_raw:x:3004:root"));
 
     // 2da pasada: no debe duplicar entradas
-    configure_android_groups(&rootfs).expect("Segunda inyección idempotente");
+    configure_android_groups(&rootfs).expect("Second idempotent injection");
     let second = fs::read_to_string(&group_file).unwrap();
     assert_eq!(first, second);
     assert_eq!(second.matches(":3003:").count(), 1);
@@ -198,18 +234,74 @@ fn test_services_stale_pid_detection_and_tunnel_states() {
 
     // 5. Token malicioso con caracteres de inyección de comandos debe ser rechazado
     let bad_token_result =
-        tunnel.setup_and_start_cloudflared("token_invalido; rm -rf /");
+        tunnel.setup_and_start_cloudflared("invalid_token; rm -rf /");
     assert!(bad_token_result.is_err());
 
     let _ = fs::remove_dir_all(&rootfs);
 }
 
 #[test]
+fn test_termux_wrappers_generation_and_permissions() {
+    let temp_dir = create_temp_rootfs("termux_wrappers");
+    let mock_termux_bin = temp_dir.join("usr/bin");
+    fs::create_dir_all(&mock_termux_bin).unwrap();
+
+    let target_bin = Path::new("/data/local/droidvps/bin/droidvps");
+
+    android::install_termux_wrappers_in(&mock_termux_bin, target_bin)
+        .expect("Should generate Termux wrappers");
+
+    for wrapper_name in ["droidvps", "dvps"] {
+        let wrapper_path = mock_termux_bin.join(wrapper_name);
+        assert!(wrapper_path.exists());
+
+        let metadata = fs::metadata(&wrapper_path).unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o755);
+
+        let content = fs::read_to_string(&wrapper_path).unwrap();
+        assert!(content.contains("exec su -mm -c"));
+        assert!(content.contains("/data/local/droidvps/bin/droidvps"));
+    }
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
+fn test_boot_autostart_script_lifecycle() {
+    let temp_dir = create_temp_rootfs("boot_autostart");
+    let mock_service_d = temp_dir.join("service.d");
+    let mock_rootfs = Path::new("/data/local/droidvps/rootfs");
+
+    // Inicialmente deshabilitado
+    assert!(!android::is_boot_autostart_enabled(Some(&mock_service_d)));
+
+    // Habilitar auto-arranque
+    let script_path = android::configure_boot_autostart(mock_rootfs, Some(&mock_service_d))
+        .expect("Should create boot autostart script");
+    assert!(script_path.exists());
+    assert!(android::is_boot_autostart_enabled(Some(&mock_service_d)));
+
+    let metadata = fs::metadata(&script_path).unwrap();
+    assert_eq!(metadata.permissions().mode() & 0o777, 0o755);
+
+    let script_content = fs::read_to_string(&script_path).unwrap();
+    assert!(script_content.contains("getprop sys.boot_completed"));
+    assert!(script_content.contains("start --target \"/data/local/droidvps/rootfs\""));
+
+    // Deshabilitar auto-arranque
+    let removed = android::remove_boot_autostart(Some(&mock_service_d))
+        .expect("Should remove boot autostart script");
+    assert!(removed);
+    assert!(!android::is_boot_autostart_enabled(Some(&mock_service_d)));
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[test]
 fn test_telemetry_collection_graceful_on_any_linux_host() {
     let telemetry = android::collect_telemetry()
-        .expect("collect_telemetry no debe fallar en WSL2 ni en Android");
+        .expect("collect_telemetry should not fail on WSL2 or Android");
 
-    // En cualquier kernel Linux (/proc/meminfo y /proc/uptime existen), debe reportar RAM y Uptime
     assert!(telemetry.memory.is_some());
     assert!(telemetry.uptime_seconds.is_some());
 }

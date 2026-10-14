@@ -21,7 +21,7 @@ pub const BANNER: &str = concat!(
     name = "droidvps",
     author = "UNKchr",
     version,
-    about = "Lightweight orchestrator to turn rooted Android devices into headless Linux servers (VPS)",
+    about = "Lightweight orchestrator to turn rooted Android devices into headless Linux VPS servers",
     long_about = None,
     before_help = BANNER
 )]
@@ -32,75 +32,90 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug, PartialEq, Eq)]
 pub enum Commands {
-    /// Descarga, verifica y despliega el sistema base (Alpine Linux Minimal aarch64)
+    /// Download, verify, and deploy the base system (Alpine Linux Minimal aarch64)
     Init {
-        /// Ruta de destino para el entorno rootfs en el dispositivo Android
+        /// Target directory path for the rootfs environment on the Android device
         #[arg(short, long, default_value = DEFAULT_ROOTFS_PATH)]
         target: PathBuf,
     },
 
-    /// Monta subsistemas del kernel e inicia una shell interactiva aislada en el contenedor
+    /// Mount kernel subsystems and enter an isolated interactive shell inside the container
     Enter {
-        /// Ruta del entorno rootfs donde se ejecutará el chroot
+        /// Target rootfs directory path where chroot will be executed
         #[arg(short, long, default_value = DEFAULT_ROOTFS_PATH)]
         target: PathBuf,
     },
 
-    /// Inicia el servidor VPS en segundo plano (Wakelock, Dropbear SSH y túneles)
+    /// Start the headless VPS node in the background (Wakelock, Dropbear SSH, and tunnels)
     Start {
-        /// Ruta del entorno rootfs activo
+        /// Target rootfs directory path
         #[arg(short, long, default_value = DEFAULT_ROOTFS_PATH)]
         target: PathBuf,
     },
 
-    /// Detiene los servicios del VPS, desmonta los sistemas de archivos y libera el Wakelock
+    /// Stop all VPS background services, unmount filesystems, and release the kernel Wakelock
     Stop {
-        /// Ruta del entorno rootfs a detener
+        /// Target rootfs directory path to stop
         #[arg(short, long, default_value = DEFAULT_ROOTFS_PATH)]
         target: PathBuf,
     },
 
-    /// Muestra el estado del contenedor, servicios activos y telemetría de hardware (batería/CPU)
+    /// Display container status, active daemons, and hardware telemetry (battery/SoC/RAM)
     Status {
-        /// Ruta del entorno rootfs a inspeccionar
+        /// Target rootfs directory path to inspect
         #[arg(short, long, default_value = DEFAULT_ROOTFS_PATH)]
         target: PathBuf,
     },
 
-    /// Asistente inteligente para instalar, autenticar y gestionar túneles de red (Tailscale / Cloudflared)
+    /// Smart assistant to install, authenticate, and manage network tunnels (Tailscale / Cloudflared)
     Tunnel {
         #[command(subcommand)]
         action: TunnelAction,
+    },
+
+    /// Install standalone binaries, Termux CLI wrappers (droidvps/dvps), and Android boot autostart
+    Setup {
+        /// Target rootfs directory path used for boot autostart
+        #[arg(short, long, default_value = DEFAULT_ROOTFS_PATH)]
+        target: PathBuf,
+
+        /// Enable automatic VPS startup on Android boot (/data/adb/service.d)
+        #[arg(long, conflicts_with = "disable_autostart")]
+        enable_autostart: bool,
+
+        /// Disable automatic VPS startup on Android boot
+        #[arg(long, conflicts_with = "enable_autostart")]
+        disable_autostart: bool,
     },
 }
 
 #[derive(Subcommand, Debug, PartialEq, Eq)]
 pub enum TunnelAction {
-    /// Instala automáticamente Tailscale, inicia tailscaled (userspace) y vincula la cuenta
+    /// Automatically install Tailscale, start tailscaled (userspace), and link the account
     Tailscale {
-        /// Ruta del entorno rootfs activo
+        /// Target rootfs directory path
         #[arg(short, long, default_value = DEFAULT_ROOTFS_PATH)]
         target: PathBuf,
 
-        /// Clave de autenticación pre-generada opcional (si se omite, muestra el enlace interactivo)
+        /// Optional pre-generated authentication key (if omitted, displays interactive login URL)
         #[arg(short, long)]
         auth_key: Option<String>,
     },
 
-    /// Descarga automáticamente cloudflared (arm64), registra el token e inicia el túnel
+    /// Automatically download cloudflared (arm64), save the token, and start the tunnel
     Cloudflared {
-        /// Ruta del entorno rootfs activo
+        /// Target rootfs directory path
         #[arg(short, long, default_value = DEFAULT_ROOTFS_PATH)]
         target: PathBuf,
 
-        /// Token de autenticación del túnel de Cloudflare Zero Trust
+        /// Cloudflare Zero Trust tunnel authentication token
         #[arg(long)]
         token: String,
     },
 
-    /// Detiene cualquier demonio de túnel activo sin apagar el servidor SSH
+    /// Stop any active network tunnel daemon without shutting down the SSH server
     Stop {
-        /// Ruta del entorno rootfs activo
+        /// Target rootfs directory path
         #[arg(short, long, default_value = DEFAULT_ROOTFS_PATH)]
         target: PathBuf,
     },

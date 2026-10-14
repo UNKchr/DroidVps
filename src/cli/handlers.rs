@@ -1,5 +1,6 @@
 use std::path::Path;
 use anyhow::{bail, Context, Result};
+use crate::android::env::TERMUX_BIN_DIR;
 use crate::cli::args::{Commands, TunnelAction};
 use crate::container::mount::MountManager;
 use crate::services::{TunnelService, TunnelStatus, DEFAULT_ROOT_PASSWORD};
@@ -27,6 +28,11 @@ pub fn handle_command(command: Commands) -> Result<()> {
     match command {
         Commands::Init { target } => {
             print_banner();
+            android::ensure_root_privileges()
+                .context("Cannot initialize rootfs without root privileges")?;
+            android::network::setup_android_network_groups()
+                .context("Failed to initialize Android network groups and DNS resolver")?;
+
             println!(
                 "[*] Initializing Alpine Linux aarch64 environment at: {}",
                 target.display()
@@ -34,7 +40,7 @@ pub fn handle_command(command: Commands) -> Result<()> {
 
             rootfs::setup_rootfs(&target).with_context(|| {
                 format!(
-                    "Failed to provision the root filesystem (rootfs) at '{}'",
+                    "Failed to provision root filesystem at '{}'",
                     target.display()
                 )
             })?;
@@ -47,14 +53,17 @@ pub fn handle_command(command: Commands) -> Result<()> {
 
         Commands::Enter { target } => {
             print_banner();
+            android::ensure_root_privileges()
+                .context("Cannot enter container without root privileges")?;
+
             println!(
-                "[*] Preparing isolation and entering the container at: {}",
+                "[*] Preparing isolation and entering container at: {}",
                 target.display()
             );
 
             container::run_shell(&target).with_context(|| {
                 format!(
-                    "Container chroot lifecycle failed at '{}'",
+                    "Error during chroot container lifecycle at '{}'",
                     target.display()
                 )
             })?;
@@ -64,8 +73,11 @@ pub fn handle_command(command: Commands) -> Result<()> {
 
         Commands::Start { target } => {
             print_banner();
+            android::ensure_root_privileges()
+                .context("Cannot start VPS services without root privileges")?;
+
             println!(
-                "[*] Starting VPS node services in the background ({})...",
+                "[*] Starting headless VPS node services in the background ({})...",
                 target.display()
             );
 
@@ -80,18 +92,18 @@ pub fn handle_command(command: Commands) -> Result<()> {
                 "\x1b[1;32m[✓] DroidVPS node is active and running in the background:\x1b[0m"
             );
             println!(
-                "  • Dropbear SSH : \x1b[1;32mActive\x1b[0m (PID: {}, TCP port: {})",
+                "  • Dropbear SSH : \x1b[1;32mRunning\x1b[0m (PID: {}, TCP Port: {})",
                 report.ssh_pid, report.ssh_port
             );
             println!(
-                "  • Credentials   : user 'root' (default initial password: '{}')",
+                "  • Credentials  : user 'root' (initial default password: '{}')",
                 DEFAULT_ROOT_PASSWORD
             );
 
             match report.tunnel_status {
                 TunnelStatus::Running { provider, pid } => {
                     println!(
-                        "  • Network Tunnel: \x1b[1;32mActive\x1b[0m [{} - PID: {}]",
+                        "  • Net Tunnel   : \x1b[1;32mRunning\x1b[0m [{} - PID: {}]",
                         provider.as_str(),
                         pid
                     );
@@ -100,12 +112,12 @@ pub fn handle_command(command: Commands) -> Result<()> {
                     configured: Some(provider),
                 } => {
                     println!(
-                        "  • Network Tunnel: \x1b[1;33mStopped\x1b[0m ({})",
+                        "  • Net Tunnel   : \x1b[1;33mStopped\x1b[0m ({})",
                         provider.as_str()
                     );
                 }
                 TunnelStatus::Stopped { configured: None } | TunnelStatus::NotConfigured => {
-                    println!("  • Network Tunnel: Not configured");
+                    println!("  • Net Tunnel   : Not configured");
                     println!(
                         "    \x1b[1;36m-> Tip:\x1b[0m Run 'droidvps tunnel tailscale' or 'droidvps tunnel cloudflared --token <TOKEN>' for remote access."
                     );
@@ -115,6 +127,9 @@ pub fn handle_command(command: Commands) -> Result<()> {
 
         Commands::Stop { target } => {
             print_banner();
+            android::ensure_root_privileges()
+                .context("Cannot stop VPS services without root privileges")?;
+
             println!(
                 "[*] Stopping VPS node services and cleaning up mounts ({})...",
                 target.display()
@@ -122,7 +137,7 @@ pub fn handle_command(command: Commands) -> Result<()> {
 
             let report = container::stop_vps(&target).with_context(|| {
                 format!(
-                    "Failed to stop services or unmount the container at '{}'",
+                    "Failed to stop services or unmount container at '{}'",
                     target.display()
                 )
             })?;
@@ -136,7 +151,7 @@ pub fn handle_command(command: Commands) -> Result<()> {
                 }
             );
             println!(
-                "  • Network Tunnel: {}",
+                "  • Net Tunnel   : {}",
                 if report.tunnel_stopped {
                     "\x1b[1;32mStopped\x1b[0m"
                 } else {
@@ -144,23 +159,24 @@ pub fn handle_command(command: Commands) -> Result<()> {
                 }
             );
             println!(
-                "  • Mounts        : {}",
+                "  • Filesystems  : {}",
                 if report.filesystems_unmounted {
                     "\x1b[1;32mUnmounted (MNT_DETACH)\x1b[0m"
                 } else {
                     "No active mounts"
                 }
             );
-            println!("\x1b[1;32m[✓] Node stopped and wakelock released.\x1b[0m");
+            println!("\x1b[1;32m[✓] Node stopped and kernel Wakelock released.\x1b[0m");
         }
 
         Commands::Status { target } => {
             print_banner();
             let vps = container::inspect_status(&target);
+            let autostart = android::is_boot_autostart_enabled(None);
 
-            println!("\x1b[1;36m[ Container and Service Status ]\x1b[0m");
+            println!("\x1b[1;36m[ Container & Services Status ]\x1b[0m");
             println!(
-                "  Alpine rootfs   : {} ({})",
+                "  Alpine Rootfs   : {} ({})",
                 target.display(),
                 if vps.rootfs_initialized {
                     "\x1b[1;32mInitialized\x1b[0m"
@@ -170,10 +186,10 @@ pub fn handle_command(command: Commands) -> Result<()> {
             );
 
             if vps.active_mounts.is_empty() {
-                println!("  Kernel mounts   : \x1b[1;33mInactive\x1b[0m");
+                println!("  Kernel Mounts   : \x1b[1;33mInactive\x1b[0m");
             } else {
                 println!(
-                    "  Kernel mounts   : \x1b[1;32mActive\x1b[0m ({})",
+                    "  Kernel Mounts   : \x1b[1;32mActive\x1b[0m ({})",
                     vps.active_mounts.join(", ")
                 );
             }
@@ -181,7 +197,7 @@ pub fn handle_command(command: Commands) -> Result<()> {
             match vps.ssh_pid {
                 Some(pid) => {
                     println!(
-                        "  Dropbear SSH    : \x1b[1;32mActive\x1b[0m (PID: {}, Port: {})",
+                        "  Dropbear SSH    : \x1b[1;32mRunning\x1b[0m (PID: {}, Port: {})",
                         pid, vps.ssh_port
                     );
                 }
@@ -196,7 +212,7 @@ pub fn handle_command(command: Commands) -> Result<()> {
             match vps.tunnel_status {
                 TunnelStatus::Running { provider, pid } => {
                     println!(
-                        "  Network Tunnel  : \x1b[1;32mActive\x1b[0m [{} - PID: {}]",
+                        "  Network Tunnel  : \x1b[1;32mRunning\x1b[0m [{} - PID: {}]",
                         provider.as_str(),
                         pid
                     );
@@ -214,19 +230,28 @@ pub fn handle_command(command: Commands) -> Result<()> {
                 }
             }
 
-            println!("\n\x1b[1;36m[ Hardware and Kernel Telemetry ]\x1b[0m");
+            println!(
+                "  Boot Autostart  : {}",
+                if autostart {
+                    "\x1b[1;32mEnabled\x1b[0m (/data/adb/service.d)"
+                } else {
+                    "\x1b[1;33mDisabled\x1b[0m"
+                }
+            );
+
+            println!("\n\x1b[1;36m[ Hardware & Kernel Telemetry ]\x1b[0m");
             let telemetry = android::collect_telemetry()
                 .context("Failed to collect hardware telemetry from sysfs/procfs")?;
 
             if let Some(uptime) = telemetry.uptime_seconds {
                 let hours = uptime / 3600;
                 let minutes = (uptime % 3600) / 60;
-                println!("  Uptime Kernel   : {}h {}m ({}s)", hours, minutes, uptime);
+                println!("  Kernel Uptime   : {}h {}m ({}s)", hours, minutes, uptime);
             }
 
             if let Some(mem) = telemetry.memory {
                 println!(
-                    "  RAM             : {} MB / {} MB ({}% used, {} MB free)",
+                    "  System Memory   : {} MB / {} MB ({}% used, {} MB available)",
                     mem.used_mb, mem.total_mb, mem.usage_percent, mem.available_mb
                 );
             }
@@ -242,7 +267,7 @@ pub fn handle_command(command: Commands) -> Result<()> {
                         .map(|v| format!(", {} mV", v))
                         .unwrap_or_default();
                     println!(
-                        "  Battery ({})    : {}% [{}]{}{}",
+                        "  Battery ({}) : {}% [{}]{}{}",
                         bat.supply_name, bat.capacity_percent, bat.status, temp_info, volt_info
                     );
                 }
@@ -254,20 +279,71 @@ pub fn handle_command(command: Commands) -> Result<()> {
             match telemetry.max_soc_temp_c {
                 Some(max_temp) => {
                     println!(
-                        "  SoC temperature : {:.1} °C max ({} active thermal zones)",
+                        "  SoC Temperature : {:.1} °C max ({} active thermal zones)",
                         max_temp,
                         telemetry.thermal_zones.len()
                     );
                 }
                 None => {
-                    println!("  SoC temperature : No thermal sensors reported in sysfs");
+                    println!("  SoC Temperature : No thermal sensors reported in sysfs");
                 }
             }
         }
 
         Commands::Tunnel { action } => {
             print_banner();
+            android::ensure_root_privileges()
+                .context("Cannot manage network tunnels without root privileges")?;
             handle_tunnel_action(action)?;
+        }
+
+        Commands::Setup {
+            target,
+            enable_autostart,
+            disable_autostart,
+        } => {
+            print_banner();
+            android::ensure_root_privileges()
+                .context("Cannot configure standalone environment without root privileges")?;
+
+            println!("[*] Configuring standalone DroidVPS environment...");
+            let installed_bin = android::setup_standalone_environment(None)
+                .context("Failed to install standalone binary and wrappers")?;
+
+            println!(
+                "  • System Binary : \x1b[1;32mInstalled\x1b[0m ({})",
+                installed_bin.display()
+            );
+
+            if Path::new(TERMUX_BIN_DIR).exists() {
+                println!(
+                    "  • Termux Bridge : \x1b[1;32mInstalled\x1b[0m ('droidvps' and 'dvps' available in Termux)"
+                );
+            } else {
+                println!("  • Termux Bridge : Skipped (Termux directory not found)");
+            }
+
+            if enable_autostart {
+                let script_path = android::configure_boot_autostart(&target, None)
+                    .context("Failed to configure boot autostart script in /data/adb/service.d")?;
+                println!(
+                    "  • Boot Service  : \x1b[1;32mEnabled\x1b[0m ({})",
+                    script_path.display()
+                );
+            } else if disable_autostart {
+                let removed = android::remove_boot_autostart(None)
+                    .context("Failed to remove boot autostart script")?;
+                println!(
+                    "  • Boot Service  : {}",
+                    if removed {
+                        "\x1b[1;33mDisabled & Removed\x1b[0m"
+                    } else {
+                        "Already disabled"
+                    }
+                );
+            }
+
+            println!("\x1b[1;32m[✓] Standalone setup completed successfully.\x1b[0m");
         }
     }
 
@@ -279,7 +355,7 @@ fn handle_tunnel_action(action: TunnelAction) -> Result<()> {
     match action {
         TunnelAction::Tailscale { target, auth_key } => {
             println!(
-                "[*] Preparing the automatic Tailscale assistant at: {}",
+                "[*] Preparing automated Tailscale assistant at: {}",
                 target.display()
             );
             prepare_runtime_environment(&target)?;
@@ -287,17 +363,17 @@ fn handle_tunnel_action(action: TunnelAction) -> Result<()> {
             let tunnel = TunnelService::new(&target);
             let pid = tunnel
                 .setup_and_authenticate_tailscale(auth_key.as_deref())
-                .context("Tailscale provisioning or authentication failed")?;
+                .context("Failed during Tailscale provisioning or authentication")?;
 
             println!(
-                "\x1b[1;32m[✓] Tailscale active and authenticated in the background (PID: {}).\x1b[0m",
+                "\x1b[1;32m[✓] Tailscale is active and authenticated in the background (PID: {}).\x1b[0m",
                 pid
             );
         }
 
         TunnelAction::Cloudflared { target, token } => {
             println!(
-                "[*] Preparing the automatic Cloudflare Tunnel assistant at: {}",
+                "[*] Preparing automated Cloudflare Tunnel assistant at: {}",
                 target.display()
             );
             prepare_runtime_environment(&target)?;
@@ -305,10 +381,10 @@ fn handle_tunnel_action(action: TunnelAction) -> Result<()> {
             let tunnel = TunnelService::new(&target);
             let pid = tunnel
                 .setup_and_start_cloudflared(&token)
-                .context("cloudflared download, configuration, or startup failed")?;
+                .context("Failed during cloudflared download, configuration, or startup")?;
 
             println!(
-                "\x1b[1;32m[✓] Cloudflare Tunnel (cloudflared) active in the background (PID: {}).\x1b[0m",
+                "\x1b[1;32m[✓] Cloudflare Tunnel (cloudflared) is active in the background (PID: {}).\x1b[0m",
                 pid
             );
             println!("    -> Event log available at <rootfs>/var/log/cloudflared.log");
@@ -316,18 +392,18 @@ fn handle_tunnel_action(action: TunnelAction) -> Result<()> {
 
         TunnelAction::Stop { target } => {
             println!(
-                "[*] Stopping tunnel services at: {}...",
+                "[*] Stopping network tunnel services at: {}...",
                 target.display()
             );
             let tunnel = TunnelService::new(&target);
             let stopped = tunnel
                 .stop()
-                .context("Failed to stop tunnel daemons")?;
+                .context("Failed while attempting to stop tunnel daemons")?;
 
             if stopped {
-                println!("\x1b[1;32m[✓] Tunnel daemon stopped successfully.\x1b[0m");
+                println!("\x1b[1;32m[✓] Network tunnel daemon stopped successfully.\x1b[0m");
             } else {
-                println!("[*] No running tunnel daemons were found.");
+                println!("[*] No active network tunnel daemons found.");
             }
         }
     }
@@ -337,7 +413,7 @@ fn handle_tunnel_action(action: TunnelAction) -> Result<()> {
 
 /// Garantiza que el rootfs esté inicializado y que los montajes/permisos del kernel Android estén activos
 fn prepare_runtime_environment(target: &Path) -> Result<()> {
-    if !target.join("bin/sh").exists() || !target.join("etc/alpine-release").exists() {
+    if !rootfs::is_rootfs_initialized(target) {
         bail!(
             "The rootfs environment at '{}' is not initialized. Run 'droidvps init' first.",
             target.display()
@@ -345,18 +421,18 @@ fn prepare_runtime_environment(target: &Path) -> Result<()> {
     }
 
     rootfs::configure_android_groups(target)
-        .context("Could not ensure Android network groups in /etc/group")?;
-    android::selinux::ensure_permissive()
-        .context("Could not verify/configure SELinux permissive mode")?;
+        .context("Failed to ensure Android network groups in /etc/group")?;
+
+    // Best-effort en kernels donde SELinux o wakelocks en sysfs devuelven EINVAL/EACCES
+    let _ = android::selinux::ensure_permissive();
     android::network::setup_android_network_groups()
-        .context("Could not inject Android network GIDs (3003/3004)")?;
-    android::power::acquire_wakelock()
-        .context("Could not acquire the kernel wakelock")?;
+        .context("Failed to inject Android network GIDs (3003/3004)")?;
+    let _ = android::power::acquire_wakelock();
 
     let mount_manager = MountManager::new(target);
     mount_manager
         .mount_all()
-        .context("Could not mount pseudo-filesystems (/dev, /proc, /sys)")?;
+        .context("Failed to mount pseudo-filesystems (/dev, /proc, /sys)")?;
 
     Ok(())
 }
