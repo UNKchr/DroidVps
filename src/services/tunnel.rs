@@ -5,15 +5,24 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
 use std::time::Duration;
+
+use flate2::read::GzDecoder;
+use tar::Archive;
+
+use crate::android::network;
 use crate::container::chroot::ChrootRunner;
+use crate::container::mount::MountManager;
 use crate::error::DroidError;
 
 const TAILSCALE_BIN_REL: &str = "usr/sbin/tailscaled";
+const TAILSCALE_CLI_REL: &str = "usr/bin/tailscale";
 const TAILSCALE_CLI_IN_CHROOT: &str = "/usr/bin/tailscale";
 const TAILSCALE_PID_REL: &str = "run/tailscaled.pid";
 const TAILSCALE_SOCKET_ARG: &str = "--socket=/run/tailscale/tailscaled.sock";
 const TAILSCALE_STATE_REL: &str = "var/lib/tailscale/tailscaled.state";
 const TAILSCALE_ENABLED_REL: &str = "etc/droidvps/tailscale.enabled";
+const TAILSCALE_STABLE_JSON_URL: &str = "https://pkgs.tailscale.com/stable/?mode=json";
+const TAILSCALE_FALLBACK_TGZ: &str = "tailscale_1.104.1_arm64.tgz";
 
 const CLOUDFLARED_BIN_REL: &str = "usr/local/bin/cloudflared";
 const CLOUDFLARED_PID_REL: &str = "run/cloudflared.pid";
@@ -93,8 +102,8 @@ impl TunnelService {
         Ok(TunnelStatus::NotConfigured)
     }
 
-    /// Flujo asistido para Tailscale: instala el paquete si falta, inicia `tailscaled`
-    /// y ejecuta `tailscale up` (con auth_key opcional o mostrando el enlace interactivo).
+    /// Flujo asistido para Tailscale: instala o actualiza los binarios estáticos oficiales,
+    /// inicia `tailscaled` y ejecuta `tailscale up`.
     pub fn setup_and_authenticate_tailscale(
         &self,
         auth_key: Option<&str>,
@@ -134,18 +143,28 @@ impl TunnelService {
         self.start_cloudflared()
     }
 
-    /// Instala (si es necesario) e inicia el demonio `tailscaled` en modo userspace networking
+    /// Instala o actualiza automáticamente Tailscale a la versión estática oficial más reciente
+    /// e inicia `tailscaled` en modo userspace networking
     pub fn start_tailscale(&self) -> Result<u32, DroidError> {
-        if let Some(pid) = self.tailscale_pid() {
+        // Si detectamos que aún está instalado el paquete antiguo de Alpine apk, detenemos y migramos al binario oficial
+        if self.is_legacy_apk_tailscale() {
+            println!("[*] Outdated Alpine apk Tailscale package detected. Upgrading to latest official static release...");
+            if let Some(old_pid) = self.tailscale_pid() {
+                self.kill_process(old_pid);
+                thread::sleep(Duration::from_millis(300));
+            }
+            self.prepare_runtime_environment()?;
+            let runner = ChrootRunner::new(&self.rootfs);
+            let _ = runner.run_command("/sbin/apk", &["del", "tailscale"]);
+            self.install_official_tailscale()?;
+        } else if let Some(pid) = self.tailscale_pid() {
             return Ok(pid);
         }
 
-        let runner = ChrootRunner::new(&self.rootfs);
+        self.prepare_runtime_environment()?;
 
         if !self.is_tailscale_installed() {
-            println!("[*] Tailscale not detected. Installing automatically via apk...");
-            runner.run_command("/sbin/apk", &["update"])?;
-            runner.run_command("/sbin/apk", &["add", "--no-cache", "tailscale"])?;
+            self.install_official_tailscale()?;
         }
 
         let run_ts_dir = self.rootfs.join("run/tailscale");
@@ -162,6 +181,7 @@ impl TunnelService {
             fs::write(&enabled_marker, b"enabled\n")?;
         }
 
+        let runner = ChrootRunner::new(&self.rootfs);
         runner.spawn_daemon(
             "/usr/sbin/tailscaled",
             &[
@@ -171,16 +191,113 @@ impl TunnelService {
             ],
         )?;
 
-        for _ in 0..20 {
+        for _ in 0..40 {
             if let Some(pid) = self.tailscale_pid() {
                 return Ok(pid);
             }
-            thread::sleep(Duration::from_millis(50));
+            thread::sleep(Duration::from_millis(100));
         }
 
         Err(DroidError::Rootfs(
             "tailscaled ran but no active process was detected in /proc".into(),
         ))
+    }
+
+    /// Descarga e instala los binarios estáticos oficiales de Tailscale (`arm64`) desde `pkgs.tailscale.com`
+    fn install_official_tailscale(&self) -> Result<(), DroidError> {
+        // Garantiza certificados CA en el contenedor para conexiones TLS de Tailscale
+        let cert_marker = self.rootfs.join("etc/ssl/certs/ca-certificates.crt");
+        if cert_marker.symlink_metadata().is_err() {
+            let runner = ChrootRunner::new(&self.rootfs);
+            runner.run_command("/sbin/apk", &["update"])?;
+            runner.run_command("/sbin/apk", &["add", "--no-cache", "ca-certificates"])?;
+        }
+
+        network::ensure_host_dns_resolver();
+        let tgz_filename = Self::resolve_latest_tailscale_tgz();
+        let download_url = format!("https://pkgs.tailscale.com/stable/{}", tgz_filename);
+
+        println!(
+            "[*] Downloading official Tailscale static binaries ({}) ...",
+            tgz_filename
+        );
+
+        let response = ureq::get(&download_url).call().map_err(|err| {
+            DroidError::Rootfs(format!(
+                "Failed to download Tailscale archive from {}: {}",
+                download_url, err
+            ))
+        })?;
+
+        let gz = GzDecoder::new(response.into_reader());
+        let mut archive = Archive::new(gz);
+
+        let sbin_dir = self.rootfs.join("usr/sbin");
+        let bin_dir = self.rootfs.join("usr/bin");
+        fs::create_dir_all(&sbin_dir)?;
+        fs::create_dir_all(&bin_dir)?;
+
+        let mut found_daemon = false;
+        let mut found_cli = false;
+
+        for entry_res in archive.entries()? {
+            let mut entry = entry_res?;
+            let path = entry.path()?;
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+
+            if name == "tailscaled" {
+                let dest = self.rootfs.join(TAILSCALE_BIN_REL);
+                entry.unpack(&dest)?;
+                fs::set_permissions(&dest, fs::Permissions::from_mode(0o755))?;
+                found_daemon = true;
+            } else if name == "tailscale" {
+                let dest = self.rootfs.join(TAILSCALE_CLI_REL);
+                entry.unpack(&dest)?;
+                fs::set_permissions(&dest, fs::Permissions::from_mode(0o755))?;
+                found_cli = true;
+            }
+        }
+
+        if !found_daemon || !found_cli {
+            return Err(DroidError::Rootfs(
+                "Official Tailscale archive did not contain expected binaries".into(),
+            ));
+        }
+
+        println!("\x1b[1;32m[✓] Official Tailscale static binaries installed successfully.\x1b[0m");
+        Ok(())
+    }
+
+    /// Consulta el endpoint JSON oficial de Tailscale para obtener el nombre del tarball estable `arm64` más reciente
+    fn resolve_latest_tailscale_tgz() -> String {
+        if let Ok(resp) = ureq::get(TAILSCALE_STABLE_JSON_URL).call() {
+            if let Ok(body) = resp.into_string() {
+                if let Some(idx) = body.find("\"arm64\":") {
+                    let rest = &body[idx + 8..];
+                    if let Some(first_quote) = rest.find('"') {
+                        let after_quote = &rest[first_quote + 1..];
+                        if let Some(end_quote) = after_quote.find('"') {
+                            let filename = &after_quote[..end_quote];
+                            if filename.starts_with("tailscale_") && filename.ends_with(".tgz") {
+                                return filename.to_string();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        TAILSCALE_FALLBACK_TGZ.to_string()
+    }
+
+    /// Detecta si `tailscale` fue instalado mediante el paquete antiguo de Alpine `apk`
+    fn is_legacy_apk_tailscale(&self) -> bool {
+        let world_file = self.rootfs.join("etc/apk/world");
+        if let Ok(content) = fs::read_to_string(world_file) {
+            return content.lines().any(|line| line.trim() == "tailscale");
+        }
+        false
     }
 
     /// Descarga automáticamente `cloudflared` (si falta) e inicia el túnel con el token configurado
@@ -203,7 +320,9 @@ impl TunnelService {
 
         Self::validate_cloudflared_token(&token)?;
 
-        // Auto-instalación inteligente si el binario no existe en el contenedor
+        self.prepare_runtime_environment()?;
+
+        // Auto-instalación inteligente de dependencias y del binario si no existe en el contenedor
         self.ensure_cloudflared_installed()?;
         self.ensure_config_dir()?;
 
@@ -213,6 +332,8 @@ impl TunnelService {
             &[
                 "tunnel",
                 "--no-autoupdate",
+                "--protocol",
+                "http2",
                 "--pidfile",
                 "/run/cloudflared.pid",
                 "--logfile",
@@ -223,11 +344,11 @@ impl TunnelService {
             ],
         )?;
 
-        for _ in 0..20 {
+        for _ in 0..40 {
             if let Some(pid) = self.cloudflared_pid() {
                 return Ok(pid);
             }
-            thread::sleep(Duration::from_millis(50));
+            thread::sleep(Duration::from_millis(100));
         }
 
         Err(DroidError::Rootfs(
@@ -235,12 +356,27 @@ impl TunnelService {
         ))
     }
 
-    /// Garantiza que el binario `/usr/local/bin/cloudflared` (`aarch64`) esté instalado.
-    /// Si no existe, lo descarga por streaming HTTP con `ureq` y le asigna permisos `0755`.
+    /// Garantiza que el binario `/usr/local/bin/cloudflared` (`aarch64`) y su capa de
+    /// compatibilidad (`gcompat` + `ca-certificates`) estén instalados.
     pub fn ensure_cloudflared_installed(&self) -> Result<(), DroidError> {
+        // Verifica que Alpine tenga certificados raíz y compatibilidad glibc para el binario oficial arm64
+        let ld_glibc = self.rootfs.join("lib/ld-linux-aarch64.so.1");
+        if ld_glibc.symlink_metadata().is_err() {
+            println!("[*] Installing glibc compatibility layer and CA certificates via apk...");
+            let runner = ChrootRunner::new(&self.rootfs);
+            runner.run_command("/sbin/apk", &["update"])?;
+            runner.run_command(
+                "/sbin/apk",
+                &["add", "--no-cache", "ca-certificates", "gcompat"],
+            )?;
+        }
+
         if self.is_cloudflared_installed() {
             return Ok(());
         }
+
+        // Asegura que el puente DNS UDP local (127.0.0.1:53) esté activo en el host antes de usar ureq
+        network::ensure_host_dns_resolver();
 
         println!("[*] cloudflared binary not detected. Downloading the official version (linux-arm64)...");
 
@@ -336,6 +472,14 @@ impl TunnelService {
         None
     }
 
+    /// Prepara el resolvedor DNS del host Android y garantiza que `/proc`, `/sys` y `/dev` estén montados
+    fn prepare_runtime_environment(&self) -> Result<(), DroidError> {
+        network::ensure_host_dns_resolver();
+        let mount_mgr = MountManager::new(&self.rootfs);
+        mount_mgr.mount_all()?;
+        Ok(())
+    }
+
     fn validate_cloudflared_token(token: &str) -> Result<(), DroidError> {
         if token.is_empty() {
             return Err(DroidError::Rootfs(
@@ -356,7 +500,10 @@ impl TunnelService {
     }
 
     fn is_tailscale_installed(&self) -> bool {
-        self.rootfs.join(TAILSCALE_BIN_REL).exists()
+        self.rootfs
+            .join(TAILSCALE_BIN_REL)
+            .symlink_metadata()
+            .is_ok()
     }
 
     fn is_tailscale_configured(&self) -> bool {
@@ -365,7 +512,10 @@ impl TunnelService {
     }
 
     fn is_cloudflared_installed(&self) -> bool {
-        self.rootfs.join(CLOUDFLARED_BIN_REL).exists()
+        self.rootfs
+            .join(CLOUDFLARED_BIN_REL)
+            .symlink_metadata()
+            .is_ok()
     }
 
     fn has_cloudflared_token(&self) -> bool {
@@ -460,4 +610,4 @@ impl TunnelService {
         }
         Ok(())
     }
-}
+}
